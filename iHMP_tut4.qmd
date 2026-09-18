@@ -1,0 +1,243 @@
+---
+title: "Untitled"
+format: html
+editor: visual
+---
+
+## MILES Replication
+
+Add Libraries
+
+```{r}
+
+library(phyloseq)  # the microbiome data container and its tools
+library(vegan)     # community ecology: diversity indices and distances
+library(dplyr) 
+library(tidyr)     # reshaping: pivot_longer
+library(ggplot2)   # plotting
+library(here)      # file access
+```
+
+Load Phyloseq object
+
+```{r}
+#| echo: false
+# Tutorial 2 saved `ps` here. These tutorials sit in a subfolder alongside the
+# earlier ones, so look in the working directory first, then one level up.
+
+ps_file <- here("data", "tutorial2_objects.RData")
+load(ps_file)
+
+ps                     # print the object's summary to confirm it loaded
+```
+
+```{r}
+sample_variables(ps)   # tell us which metadata columns are available to group by?
+nsamples(ps)   # 855 samples
+ntaxa(ps)      # 96 features
+```
+
+```{r}
+# What taxonomic ranks are in the table, and how many features at each?
+taxonomy <- as.data.frame(as(tax_table(ps), "matrix"))
+table(taxonomy$Rank)  # Genus = 45
+```
+
+```{r}
+# Are these read counts, or proportions? Counts are whole numbers >= 0.
+range(otu_table(ps))
+```
+
+The values run from 0 to just under 1 rather than being whole numbers, so this is **relative abundance, not raw counts**. That single fact shapes the whole analysis: it is why two diversity estimators are unavailable in Step 4, and why Tutorial 5 has to transform the data before testing any genus.
+
+```{r}
+# The grouping variable the whole comparison rests on
+table(sample_data(ps)$ir_is_classification, useNA = "ifany")
+```
+
+```{r}
+# The genera MILES reported, written down before we look at anything
+miles_genera <- c("Alistipes", "Coprococcus", "Flavonifractor", "Odoribacter",
+                  "Oscillibacter", "Pseudoflavonifractor", "Anaerostipes")
+
+# Every genus name this dataset knows about
+hmp2_genera <- taxonomy$Taxon[taxonomy$Rank == "Genus"]
+
+data.frame(Genus = miles_genera, present_in_HMP2 = miles_genera %in% hmp2_genera) # Six of the seven are here. Anaerostipes is not!
+```
+
+A genus you cannot test is not a genus that failed the test. Either *Anaerostipes* is genuinely absent from these participants, or the HMP2 classifier never assigned reads to it — different reference databases and different 16S regions resolve genera differently, and MILES used shotgun metagenomics rather than a 16S amplicon at all. The data cannot tell us which. Report it as “not detected”, and be honest that we could only check six sevenths of the MILES claim.
+
+```{r}
+# Samples per visit, biggest first
+head(sort(table(sample_data(ps)$VisitID), decreasing = TRUE), 4) 
+```
+
+```{r}
+visit01 <- subset_samples(ps, VisitID == "01")
+nsamples(visit01)   # 855 samples down to 69 to deal with longitudinal visits
+```
+
+```{r}
+visit01_IRIS <- subset_samples(visit01, ir_is_classification %in% c("IR", "IS"))
+
+nsamples(visit01_IRIS)                                 # 69 down to 44
+```
+
+```{r}
+visit01_IRIS <- subset_taxa(visit01_IRIS, Rank == "Genus")
+
+ntaxa(visit01_IRIS)   # 96 features down to 45 genera
+```
+
+```{r}
+sum(taxa_sums(visit01_IRIS) == 0)   # how many all-zero genera?
+```
+
+```{r}
+visit01_IRIS <- prune_taxa(taxa_sums(visit01_IRIS) > 0, visit01_IRIS)
+ntaxa(visit01_IRIS)
+```
+
+```{r}
+visit01_IRIS
+```
+
+```{r}
+summary(sample_sums(visit01_IRIS))   # note: these do NOT sum to 1
+```
+
+Notice the sample sums fall short of 1. Reads that HMP2 could classify to family or order but not all the way to genus were reported at those coarser ranks, and we just dropped those ranks. Each sample is therefore on a slightly different scale, which we correct by renormalizing in the next step.
+
+```{r}
+# Divide each sample by its own total, so every sample sums to 1
+visit01_rel <- transform_sample_counts(visit01_IRIS, function(x) x / sum(x))
+
+# Check it worked: every sample total should now be 1
+all(abs(sample_sums(visit01_rel) - 1) < 1e-9)
+```
+
+```{r}
+# One row per sample x genus, with metadata and the clean Taxon label attached
+df <- psmelt(visit01_rel)
+dim(df)   # 44 samples x 45 genera = 1980 rows
+```
+
+```{r}
+# Mean relative abundance of each genus within each group
+genus_means <- df |>
+  group_by(ir_is_classification, Taxon) |>
+  summarise(mean_abund = mean(Abundance), .groups = "drop")
+
+ggplot(genus_means, aes(x = ir_is_classification, y = mean_abund, fill = Taxon)) +
+  geom_col() +                                  # stacked bar, one column per group
+  labs(
+    title = "Mean genus-level composition by IR / IS group",
+    x     = "IR / IS classification",
+    y     = "Mean relative abundance"
+  ) +
+  theme_minimal() +
+  theme(legend.key.size = unit(0.3, "cm"),      # 45 genera need a small legend
+        legend.text     = element_text(size = 6))
+```
+
+```{r}
+genus_means |>
+  group_by(ir_is_classification) |>
+  slice_max(mean_abund, n = 5) |>               # the 5 biggest genera per group
+  mutate(percent = round(100 * mean_abund, 1)) |>
+  select(ir_is_classification, Taxon, percent)
+```
+
+## **Compare genus evenness between IR and IS**
+
+```{r}
+# vegan wants a samples x genera matrix; phyloseq may store it either way round,
+# so check with taxa_are_rows() and transpose if needed.
+mat <- as(otu_table(visit01_rel), "matrix")
+if (taxa_are_rows(visit01_rel)) mat <- t(mat)
+
+alpha <- data.frame(
+  SampleID = rownames(mat),
+  Observed = rowSums(mat > 0),                        # richness: genera present
+  Shannon  = vegan::diversity(mat, index = "shannon"),
+  Simpson  = vegan::diversity(mat, index = "simpson"),
+  Group    = factor(sample_data(visit01_rel)$ir_is_classification[
+    match(rownames(mat), sample_names(visit01_rel))],
+    levels = c("IR", "IS"))
+)
+
+head(alpha)
+```
+
+```{r}
+# look before you test
+alpha_long <- pivot_longer(alpha, c(Observed, Shannon, Simpson),
+                           names_to = "Index", values_to = "Value")
+
+ggplot(alpha_long, aes(x = Group, y = Value, fill = Group)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.5) +   # box = spread of the group
+  geom_jitter(width = 0.15, size = 1.6, alpha = 0.7) +  # every sample as a point
+  facet_wrap(~ Index, scales = "free_y") +          # one panel per index
+  labs(
+    title    = "Alpha diversity by insulin classification",
+    subtitle = "Visit 01, n = 28 IR and 16 IS",
+    x        = "Insulin sensitivity classification",
+    y        = NULL
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+```{r}
+alpha |>
+  group_by(Group) |>
+  summarise(n = n(),
+            across(c(Observed, Shannon, Simpson),
+                   list(mean = ~round(mean(.x), 2), sd = ~round(sd(.x), 2))))
+```
+
+```{r}
+# One test per index, comparing IR against IS
+for (m in c("Observed", "Shannon", "Simpson")) {
+  p <- suppressWarnings(wilcox.test(alpha[[m]] ~ alpha$Group)$p.value)
+  cat(sprintf("%-9s  p = %.3f\n", m, p))
+}
+```
+
+**Reading the result.** All three indices are higher in the insulin-sensitive samples, which is the direction the literature predicts: mean Shannon is 2.00 in IR against 2.19 in IS. But direction is not evidence. Shannon gives p = 0.23 and Simpson p = 0.33, neither close to significant at 28 versus 16 samples. Observed richness lands at p = 0.047, just under the conventional threshold — one test among three, on a dataset we are about to test 45 more times, so treat it as a lead rather than a finding.
+
+The honest summary: **the two groups’ communities are similarly diverse, with a consistent but weak lean toward the insulin-sensitive samples.**
+
+```{r}
+visit01_ord <- ordinate(visit01_rel, method = "PCoA", distance = "bray")
+
+plot_ordination(visit01_rel, visit01_ord,
+                color = "ir_is_classification",   # color each point by group
+                shape = "ir_is_classification") + # and give each its own shape
+  geom_point(size = 3, alpha = 0.8) +
+  labs(
+    title    = "PCoA of gut community structure at Visit 01",
+    subtitle = "Bray-Curtis dissimilarity, colored by insulin sensitivity",
+    color    = "IR / IS",
+    shape    = "IR / IS"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+# How much of the real structure the two plotted axes actually capture, as a %
+round(100 * visit01_ord$values$Relative_eig[1:2], 1)
+```
+
+**What the picture shows.** IR and IS samples are heavily intermingled. There is no clean separation into two clouds, so whatever difference exists between the groups is small compared with how much individuals differ from one another. That is completely typical of microbiome studies. The two plotted axes carry about 38% and 12% of the structure, so roughly half of it is not on this plot at all.
+
+> 
+
+```{r}
+# The subset itself, plus the normalized version Tutorial 5 works from
+save(visit01, visit01_IRIS, visit01_rel, file = "visit01_ps.RData")
+
+# The summaries this tutorial produced, so Tutorial 5 can quote them
+save(alpha, genus_means, visit01_ord, file = "tutorial4_objects.RData")
+```
